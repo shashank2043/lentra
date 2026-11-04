@@ -1,0 +1,149 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum LoanType {
+  EMI
+  INTEREST_FREE
+  INTEREST_ONLY
+  FLEXIBLE
+}
+
+enum LoanStatus {
+  ACTIVE
+  CLOSED
+}
+
+enum InterestMode {
+  FIXED
+  PERCENT
+}
+
+enum PaymentKind {
+  INSTALLMENT
+  INTEREST
+  PRINCIPAL
+}
+
+enum ReminderTrigger {
+  BEFORE
+  ON_DAY
+  OVERDUE
+}
+
+enum InstallmentStatus {
+  PENDING
+  PAID
+  OVERDUE
+}
+
+enum ReminderRecipient {
+  OWNER
+  BORROWER
+}
+
+model Borrower {
+  id        String   @id @default(cuid())
+  name      String
+  phone     String?
+  email     String?
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  loans     Loan[]
+}
+
+model Loan {
+  id               String          @id @default(cuid())
+  borrowerId       String
+  borrower         Borrower        @relation(fields: [borrowerId], references: [id], onDelete: Restrict)
+  type             LoanType
+  principalAmount  Decimal         @db.Decimal(14, 2)
+  startDate        DateTime
+  dueDay           Int             // 1-31
+  monthlyAmount    Decimal?        @db.Decimal(14, 2)
+  totalMonths      Int?
+  interestMode     InterestMode?
+  interestValue    Decimal?        @db.Decimal(14, 2)
+  status           LoanStatus      @default(ACTIVE)
+  remindDaysBefore Int[]           @default([3])
+  remindOnDueDay   Boolean         @default(true)
+  remindBorrower   Boolean         @default(false)
+  notes            String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  payments         Payment[]
+  reminderLogs     ReminderLog[]
+  installments     EmiInstallment[]
+
+  @@index([borrowerId])
+  @@index([status])
+}
+
+model Payment {
+  id          String          @id @default(cuid())
+  loanId      String
+  loan        Loan            @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  paidOn      DateTime
+  amount      Decimal         @db.Decimal(14, 2)
+  kind        PaymentKind
+  note        String?
+  createdAt   DateTime        @default(now())
+  installment EmiInstallment?
+
+  @@index([loanId])
+  @@index([paidOn])
+}
+
+model ReminderLog {
+  id        String            @id @default(cuid())
+  loanId    String
+  loan      Loan              @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  dueDate   DateTime
+  trigger   ReminderTrigger
+  recipient ReminderRecipient
+  sentAt    DateTime          @default(now())
+
+  @@unique([loanId, dueDate, trigger, recipient])
+  @@index([loanId])
+}
+
+model EmiInstallment {
+  id             String            @id @default(cuid())
+  loanId         String
+  loan           Loan              @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  installmentNo  Int               // 1, 2, ..., totalMonths
+  dueDate        DateTime          // Exact due date for this installment
+  amount         Decimal           @db.Decimal(14, 2)
+  status         InstallmentStatus @default(PENDING)
+  paidAt         DateTime?
+  paymentId      String?           @unique
+  payment        Payment?          @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  lastReminderAt DateTime?         // For tracking the 2-day reminder cadence when overdue
+  notes          String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@unique([loanId, installmentNo])
+  @@index([dueDate, status])
+  @@index([status])
+  @@index([loanId])
+}
+
+model InAppNotification {
+  id        String   @id @default(cuid())
+  title     String
+  message   String
+  type      String   // "OVERDUE", "DUE_TODAY", "UPCOMING", "SYSTEM"
+  link      String?  // e.g. "/dues" or "/loans/xyz"
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([isRead, createdAt])
+}
