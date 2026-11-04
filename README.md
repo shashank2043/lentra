@@ -216,6 +216,9 @@ npx prisma db push
 
 ### 4. Vercel Cron Configuration Note
 > [!IMPORTANT]
+> **Detailed Setup Guide Available**:
+> See the complete step-by-step instructions in [VERCEL_CRON_SETUP.md](file:///F:/lentra/VERCEL_CRON_SETUP.md) for setting up environment variables, securing the endpoint with `CRON_SECRET`, monitoring execution logs, and manual testing.
+>
 > **Vercel Hobby Plan Cron Limitations**:
 > On the Vercel Hobby plan, cron jobs run **at most once per day**.
 > The configured cron job in `vercel.json` runs daily at **`03:00 UTC` (08:30 AM IST)**:
