@@ -17,9 +17,18 @@ export async function syncOverdueInstallments(): Promise<{ transitionedCount: nu
       status: "PENDING",
       dueDate: { lt: todayStart },
     },
-    include: {
+    select: {
+      id: true,
+      amount: true,
+      installmentNo: true,
+      dueDate: true,
       loan: {
-        include: { borrower: true },
+        select: {
+          borrowerId: true,
+          borrower: {
+            select: { name: true },
+          },
+        },
       },
     },
   });
@@ -142,66 +151,75 @@ export async function markInstallmentAsPaid(
   installmentId: string,
   options?: { paidOn?: Date | string; note?: string }
 ) {
-  const installment = await prisma.emiInstallment.findUnique({
-    where: { id: installmentId },
-    include: { loan: true },
-  });
-
-  if (!installment) {
-    throw new Error("Installment not found");
-  }
-
-  if (installment.status === "PAID") {
-    return installment;
-  }
-
-  const paidDate = options?.paidOn
-    ? typeof options.paidOn === "string"
-      ? new Date(options.paidOn)
-      : options.paidOn
-    : getNowInKolkata();
-
-  // Create Payment record
-  const payment = await prisma.payment.create({
-    data: {
-      loanId: installment.loanId,
-      amount: installment.amount,
-      paidOn: paidDate,
-      kind: "INSTALLMENT",
-      note: options?.note || `Payment for EMI #${installment.installmentNo} (Due ${formatToKolkataDateString(installment.dueDate)})`,
-    },
-  });
-
-  // Update Installment to PAID
-  const updated = await prisma.emiInstallment.update({
-    where: { id: installmentId },
-    data: {
-      status: "PAID",
-      paidAt: paidDate,
-      paymentId: payment.id,
-    },
-    include: {
-      loan: { include: { borrower: true } },
-      payment: true,
-    },
-  });
-
-  // Check if all installments for this loan are now PAID
-  const remainingUnpaid = await prisma.emiInstallment.count({
-    where: {
-      loanId: installment.loanId,
-      status: { in: ["PENDING", "OVERDUE"] },
-    },
-  });
-
-  if (remainingUnpaid === 0) {
-    await prisma.loan.update({
-      where: { id: installment.loanId },
-      data: { status: "CLOSED" },
+  return prisma.$transaction(async (tx) => {
+    const installment = await tx.emiInstallment.findUnique({
+      where: { id: installmentId },
+      select: {
+        id: true,
+        loanId: true,
+        installmentNo: true,
+        amount: true,
+        dueDate: true,
+        status: true,
+      },
     });
-  }
 
-  return updated;
+    if (!installment) {
+      throw new Error("Installment not found");
+    }
+
+    if (installment.status === "PAID") {
+      return installment;
+    }
+
+    const paidDate = options?.paidOn
+      ? typeof options.paidOn === "string"
+        ? new Date(options.paidOn)
+        : options.paidOn
+      : getNowInKolkata();
+
+    // Create Payment record
+    const payment = await tx.payment.create({
+      data: {
+        loanId: installment.loanId,
+        amount: installment.amount,
+        paidOn: paidDate,
+        kind: "INSTALLMENT",
+        note: options?.note || `Payment for EMI #${installment.installmentNo} (Due ${formatToKolkataDateString(installment.dueDate)})`,
+      },
+    });
+
+    // Update Installment to PAID
+    const updated = await tx.emiInstallment.update({
+      where: { id: installmentId },
+      data: {
+        status: "PAID",
+        paidAt: paidDate,
+        paymentId: payment.id,
+      },
+      include: {
+        loan: { include: { borrower: true } },
+        payment: true,
+      },
+    });
+
+    // Check if all installments for this loan are now PAID
+    const remainingUnpaid = await tx.emiInstallment.count({
+      where: {
+        loanId: installment.loanId,
+        status: { in: ["PENDING", "OVERDUE"] },
+      },
+    });
+
+    if (remainingUnpaid === 0) {
+      await tx.loan.update({
+        where: { id: installment.loanId },
+        data: { status: "CLOSED" },
+      });
+    }
+
+    return updated;
+  });
 }
 
 /**
@@ -211,36 +229,44 @@ export async function updateInstallmentStatus(
   installmentId: string,
   status: "PENDING" | "OVERDUE"
 ) {
-  const installment = await prisma.emiInstallment.findUnique({
-    where: { id: installmentId },
-  });
-
-  if (!installment) {
-    throw new Error("Installment not found");
-  }
-
-  // If reverting from PAID, remove the linked payment
-  if (installment.status === "PAID" && installment.paymentId) {
-    await prisma.payment.delete({
-      where: { id: installment.paymentId },
+  return prisma.$transaction(async (tx) => {
+    const installment = await tx.emiInstallment.findUnique({
+      where: { id: installmentId },
+      select: {
+        id: true,
+        loanId: true,
+        status: true,
+        paymentId: true,
+      },
     });
-  }
 
-  // If status transitions back to PENDING or OVERDUE and loan was CLOSED, reopen loan
-  await prisma.loan.update({
-    where: { id: installment.loanId },
-    data: { status: "ACTIVE" },
-  });
+    if (!installment) {
+      throw new Error("Installment not found");
+    }
 
-  return prisma.emiInstallment.update({
-    where: { id: installmentId },
-    data: {
-      status,
-      paidAt: null,
-      paymentId: null,
-    },
-    include: {
-      loan: { include: { borrower: true } },
-    },
+    // If reverting from PAID, remove the linked payment
+    if (installment.status === "PAID" && installment.paymentId) {
+      await tx.payment.delete({
+        where: { id: installment.paymentId },
+      });
+    }
+
+    // If status transitions back to PENDING or OVERDUE and loan was CLOSED, reopen loan
+    await tx.loan.update({
+      where: { id: installment.loanId },
+      data: { status: "ACTIVE" },
+    });
+
+    return tx.emiInstallment.update({
+      where: { id: installmentId },
+      data: {
+        status,
+        paidAt: null,
+        paymentId: null,
+      },
+      include: {
+        loan: { include: { borrower: true } },
+      },
+    });
   });
 }

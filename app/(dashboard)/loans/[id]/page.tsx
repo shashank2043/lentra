@@ -119,9 +119,9 @@ function LoanDetailContent() {
   const [editNotes, setEditNotes] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
 
-  const fetchLoan = async () => {
+  const fetchLoan = async (options?: { silent?: boolean }) => {
     try {
-      setLoading(true);
+      if (!options?.silent) setLoading(true);
       const res = await fetch(`/api/loans/${id}`);
       if (!res.ok) throw new Error("Loan not found.");
       const data = await res.json();
@@ -140,7 +140,7 @@ function LoanDetailContent() {
     } catch (err: any) {
       setActionError(err.message);
     } finally {
-      setLoading(false);
+      if (!options?.silent) setLoading(false);
     }
   };
 
@@ -224,6 +224,97 @@ function LoanDetailContent() {
         setActionError(err.message);
       }
     }
+  };
+
+  // Optimistic Mark Installment as Paid (instant UI update + background save + rollback)
+  const handleMarkInstallmentPaidOptimistic = (instId: string, installmentNo: number, amount: string) => {
+    if (!loan) return;
+    const prevLoan = { ...loan };
+
+    const numAmt = parseFloat(amount) || 0;
+    const todayIso = new Date().toISOString();
+
+    setLoan((prev) => {
+      if (!prev) return prev;
+      const updatedInstallments = prev.installments?.map((inst) =>
+        inst.id === instId
+          ? { ...inst, status: "PAID" as const, paidAt: todayIso }
+          : inst
+      );
+      const newTotalPaid = (parseFloat(prev.calculations.totalPaid || "0") + numAmt).toFixed(2);
+      const newRemaining = Math.max(0, parseFloat(prev.calculations.remainingAmount || "0") - numAmt).toFixed(2);
+      const newMonthsRemaining = Math.max(0, (prev.calculations.monthsRemaining || 1) - 1);
+
+      return {
+        ...prev,
+        installments: updatedInstallments,
+        calculations: {
+          ...prev.calculations,
+          totalPaid: newTotalPaid,
+          remainingAmount: newRemaining,
+          monthsRemaining: newMonthsRemaining,
+        },
+      };
+    });
+
+    setActionSuccess(`EMI #${installmentNo} marked as PAID.`);
+    setActionError(null);
+
+    fetch(`/api/dues/${instId}/pay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: `EMI #${installmentNo} paid` }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || "Failed to mark as paid");
+        }
+        fetchLoan({ silent: true });
+      })
+      .catch((err) => {
+        console.error("Mark paid error:", err);
+        setLoan(prevLoan);
+        setActionError(`Failed to save payment for EMI #${installmentNo}. Reverted.`);
+      });
+  };
+
+  const handleInstallmentStatusOptimistic = (instId: string, installmentNo: number, newStatus: "OVERDUE" | "PENDING") => {
+    if (!loan) return;
+    const prevLoan = { ...loan };
+
+    setLoan((prev) => {
+      if (!prev) return prev;
+      const updatedInstallments = prev.installments?.map((inst) =>
+        inst.id === instId
+          ? { ...inst, status: newStatus }
+          : inst
+      );
+      return {
+        ...prev,
+        installments: updatedInstallments,
+      };
+    });
+
+    setActionSuccess(`EMI #${installmentNo} marked as ${newStatus}.`);
+
+    fetch(`/api/dues/${instId}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: newStatus }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || "Failed to update status");
+        }
+        fetchLoan({ silent: true });
+      })
+      .catch((err) => {
+        console.error("Status update error:", err);
+        setLoan(prevLoan);
+        setActionError(`Failed to update status for EMI #${installmentNo}. Reverted.`);
+      });
   };
 
   // Save Edit (principalAmount and startDate are never included)
@@ -554,30 +645,16 @@ function LoanDetailContent() {
                           <div className="inline-flex items-center space-x-1.5">
                             <button
                               type="button"
-                              onClick={async () => {
-                                const res = await fetch(`/api/dues/${inst.id}/pay`, {
-                                  method: "POST",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ note: `EMI #${inst.installmentNo} paid` }),
-                                });
-                                if (res.ok) fetchLoan();
-                              }}
-                              className="px-2.5 py-1 bg-emerald-600 text-white rounded text-xs font-semibold hover:bg-emerald-700"
+                              onClick={() => handleMarkInstallmentPaidOptimistic(inst.id, inst.installmentNo, inst.amount)}
+                              className="px-2.5 py-1 bg-emerald-600 text-white rounded text-xs font-semibold hover:bg-emerald-700 active:scale-95 transition-all cursor-pointer"
                             >
                               Mark Paid
                             </button>
                             {inst.status === "PENDING" && (
                               <button
                                 type="button"
-                                onClick={async () => {
-                                  const res = await fetch(`/api/dues/${inst.id}/status`, {
-                                    method: "PATCH",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ status: "OVERDUE" }),
-                                  });
-                                  if (res.ok) fetchLoan();
-                                }}
-                                className="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-medium hover:bg-red-200"
+                                onClick={() => handleInstallmentStatusOptimistic(inst.id, inst.installmentNo, "OVERDUE")}
+                                className="px-2 py-1 bg-red-100 text-red-700 rounded text-xs font-medium hover:bg-red-200 active:scale-95 transition-all cursor-pointer"
                               >
                                 Mark Overdue
                               </button>

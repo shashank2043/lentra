@@ -17,6 +17,7 @@ import {
   X,
   FileText,
   User,
+  RotateCcw,
 } from "lucide-react";
 import { formatINR, formatReadableDate } from "@/lib/format";
 
@@ -59,6 +60,16 @@ interface DuesStats {
   paidThisMonthAmount: string;
 }
 
+interface ToastMessage {
+  id: string;
+  type: "success" | "error" | "info";
+  message: string;
+  action?: {
+    label: string;
+    onClick: () => void;
+  };
+}
+
 export default function DuesPage() {
   return (
     <Suspense fallback={<div className="p-8 text-center text-gray-500">Loading dues...</div>}>
@@ -82,20 +93,38 @@ function DuesContent() {
   const [stats, setStats] = useState<DuesStats | null>(null);
   const [borrowers, setBorrowers] = useState<{ id: string; name: string }[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [isPending, startTransition] = useTransition();
+
+  // Toast notifications for instant feedback
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  const showToast = (toast: Omit<ToastMessage, "id">) => {
+    const id = Math.random().toString(36).substring(2, 9);
+    setToasts((prev) => [...prev, { ...toast, id }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4500);
+  };
+
+  const removeToast = (id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  };
 
   // Payment confirmation dialog state
   const [payModalItem, setPayModalItem] = useState<InstallmentItem | null>(null);
   const [payDate, setPayDate] = useState<string>(new Date().toISOString().split("T")[0]);
   const [payNote, setPayNote] = useState<string>("");
-  const [submittingPay, setSubmittingPay] = useState(false);
 
-  // Status action state
-  const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
-
-  const fetchDues = async () => {
+  const fetchDues = async (options?: { silent?: boolean }) => {
     try {
-      setLoading(true);
+      if (!options?.silent) {
+        if (installments.length === 0) {
+          setLoading(true);
+        } else {
+          setIsRefreshing(true);
+        }
+      }
       const params = new URLSearchParams();
       if (statusTab !== "ALL") params.set("status", statusTab);
       if (borrowerFilter) params.set("borrowerId", borrowerFilter);
@@ -110,6 +139,7 @@ function DuesContent() {
       console.error("Failed to fetch dues:", err);
     } finally {
       setLoading(false);
+      setIsRefreshing(false);
     }
   };
 
@@ -133,56 +163,202 @@ function DuesContent() {
     fetchDues();
   }, [statusTab, borrowerFilter]);
 
-  const handleMarkPaidConfirm = async () => {
-    if (!payModalItem) return;
-    try {
-      setSubmittingPay(true);
-      const res = await fetch(`/api/dues/${payModalItem.id}/pay`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          paidOn: payDate,
-          note: payNote,
-        }),
-      });
+  // Optimistic Mark Paid: updates UI instantly in 0ms, saves in background, reverts on error
+  const performMarkPaid = (
+    item: InstallmentItem,
+    customPaidDate?: string,
+    customNote?: string
+  ) => {
+    // 1. Snapshot previous state for rollback
+    const prevInstallments = [...installments];
+    const prevStats = stats ? { ...stats } : null;
 
-      if (res.ok) {
-        setPayModalItem(null);
-        setPayNote("");
-        fetchDues();
-      } else {
-        const err = await res.json();
-        alert(err.error || "Failed to mark as paid");
+    // 2. Dismiss modal immediately
+    setPayModalItem(null);
+    setPayNote("");
+
+    const effectivePaidDate = customPaidDate || new Date().toISOString().split("T")[0];
+    const effectiveNote =
+      customNote !== undefined
+        ? customNote
+        : (item.notes || `EMI #${item.installmentNo} for ${item.loan.borrower.name}`);
+    const itemAmt = parseFloat(item.amount) || 0;
+
+    // 3. Optimistic local update of installments
+    setInstallments((prev) =>
+      prev.map((inst) =>
+        inst.id === item.id
+          ? {
+              ...inst,
+              status: "PAID" as const,
+              paidAt: effectivePaidDate,
+              notes: effectiveNote,
+              isPastDue: false,
+              isDueToday: false,
+            }
+          : inst
+      )
+    );
+
+    // 4. Optimistic update of stats KPI cards
+    if (stats) {
+      const updatedStats = { ...stats };
+      if (item.status === "OVERDUE") {
+        updatedStats.overdueCount = Math.max(0, updatedStats.overdueCount - 1);
+        updatedStats.overdueAmount = Math.max(0, parseFloat(updatedStats.overdueAmount) - itemAmt).toFixed(2);
       }
-    } catch (err) {
-      console.error(err);
-      alert("Error marking installment as paid");
-    } finally {
-      setSubmittingPay(false);
+      if (item.isDueToday && item.status !== "PAID") {
+        updatedStats.dueTodayCount = Math.max(0, updatedStats.dueTodayCount - 1);
+        updatedStats.dueTodayAmount = Math.max(0, parseFloat(updatedStats.dueTodayAmount) - itemAmt).toFixed(2);
+      }
+      if (item.status === "PENDING" && !item.isDueToday && !item.isPastDue) {
+        updatedStats.upcomingCount = Math.max(0, updatedStats.upcomingCount - 1);
+        updatedStats.upcomingAmount = Math.max(0, parseFloat(updatedStats.upcomingAmount) - itemAmt).toFixed(2);
+      }
+      updatedStats.paidThisMonthCount += 1;
+      updatedStats.paidThisMonthAmount = (parseFloat(updatedStats.paidThisMonthAmount) + itemAmt).toFixed(2);
+      setStats(updatedStats);
     }
+
+    // 5. Instant Toast with Undo option
+    showToast({
+      type: "success",
+      message: `EMI #${item.installmentNo} for ${item.loan.borrower.name} marked as PAID.`,
+      action: {
+        label: "Undo",
+        onClick: () => handleStatusChangeOptimistic(item.id, "PENDING", prevInstallments, prevStats),
+      },
+    });
+
+    // 6. Save in background
+    fetch(`/api/dues/${item.id}/pay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        paidOn: effectivePaidDate,
+        note: effectiveNote,
+      }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || "Failed to save payment to database");
+        }
+        const data = await res.json();
+        if (data.installment?.paymentId) {
+          setInstallments((curr) =>
+            curr.map((inst) =>
+              inst.id === item.id ? { ...inst, paymentId: data.installment.paymentId } : inst
+            )
+          );
+        }
+        // Silently sync server stats/fields without screen flash
+        fetchDues({ silent: true });
+      })
+      .catch((err: any) => {
+        console.error("Background payment save failed:", err);
+        // REVERT THE STATE!
+        setInstallments(prevInstallments);
+        if (prevStats) setStats(prevStats);
+        showToast({
+          type: "error",
+          message: `Failed to save payment for EMI #${item.installmentNo}. Reverted.`,
+        });
+      });
   };
 
-  const handleStatusChange = async (installmentId: string, newStatus: "OVERDUE" | "PENDING") => {
-    try {
-      setActionLoadingId(installmentId);
-      const res = await fetch(`/api/dues/${installmentId}/status`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: newStatus }),
-      });
+  // Optimistic Status Change: Overdue <-> Pending <-> Undo Paid
+  const handleStatusChangeOptimistic = (
+    installmentId: string,
+    newStatus: "OVERDUE" | "PENDING",
+    rollbackInstallments?: InstallmentItem[],
+    rollbackStats?: DuesStats | null
+  ) => {
+    const target = installments.find((inst) => inst.id === installmentId);
+    const prevInstallments = rollbackInstallments || [...installments];
+    const prevStats = rollbackStats !== undefined ? rollbackStats : (stats ? { ...stats } : null);
 
-      if (res.ok) {
-        fetchDues();
-      } else {
-        const err = await res.json();
-        alert(err.error || "Failed to update status");
+    const itemAmt = target ? parseFloat(target.amount) || 0 : 0;
+    const oldStatus = target ? target.status : "PAID";
+
+    // Optimistic UI update
+    setInstallments((prev) =>
+      prev.map((inst) =>
+        inst.id === installmentId
+          ? {
+              ...inst,
+              status: newStatus,
+              paidAt: null,
+              paymentId: null,
+            }
+          : inst
+      )
+    );
+
+    if (stats) {
+      const updatedStats = { ...stats };
+      if (oldStatus === "PAID") {
+        updatedStats.paidThisMonthCount = Math.max(0, updatedStats.paidThisMonthCount - 1);
+        updatedStats.paidThisMonthAmount = Math.max(0, parseFloat(updatedStats.paidThisMonthAmount) - itemAmt).toFixed(2);
+        if (target?.isPastDue || newStatus === "OVERDUE") {
+          updatedStats.overdueCount += 1;
+          updatedStats.overdueAmount = (parseFloat(updatedStats.overdueAmount) + itemAmt).toFixed(2);
+        } else if (target?.isDueToday) {
+          updatedStats.dueTodayCount += 1;
+          updatedStats.dueTodayAmount = (parseFloat(updatedStats.dueTodayAmount) + itemAmt).toFixed(2);
+        } else {
+          updatedStats.upcomingCount += 1;
+          updatedStats.upcomingAmount = (parseFloat(updatedStats.upcomingAmount) + itemAmt).toFixed(2);
+        }
+      } else if (oldStatus === "PENDING" && newStatus === "OVERDUE") {
+        if (!target?.isDueToday) {
+          updatedStats.upcomingCount = Math.max(0, updatedStats.upcomingCount - 1);
+          updatedStats.upcomingAmount = Math.max(0, parseFloat(updatedStats.upcomingAmount) - itemAmt).toFixed(2);
+        }
+        updatedStats.overdueCount += 1;
+        updatedStats.overdueAmount = (parseFloat(updatedStats.overdueAmount) + itemAmt).toFixed(2);
+      } else if (oldStatus === "OVERDUE" && newStatus === "PENDING") {
+        updatedStats.overdueCount = Math.max(0, updatedStats.overdueCount - 1);
+        updatedStats.overdueAmount = Math.max(0, parseFloat(updatedStats.overdueAmount) - itemAmt).toFixed(2);
+        if (target?.isDueToday) {
+          updatedStats.dueTodayCount += 1;
+          updatedStats.dueTodayAmount = (parseFloat(updatedStats.dueTodayAmount) + itemAmt).toFixed(2);
+        } else {
+          updatedStats.upcomingCount += 1;
+          updatedStats.upcomingAmount = (parseFloat(updatedStats.upcomingAmount) + itemAmt).toFixed(2);
+        }
       }
-    } catch (err) {
-      console.error(err);
-      alert("Error updating status");
-    } finally {
-      setActionLoadingId(null);
+      setStats(updatedStats);
     }
+
+    showToast({
+      type: "info",
+      message: target
+        ? `EMI #${target.installmentNo} updated to ${newStatus}.`
+        : `Status updated to ${newStatus}.`,
+    });
+
+    fetch(`/api/dues/${installmentId}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: newStatus }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || "Failed to update status in database");
+        }
+        fetchDues({ silent: true });
+      })
+      .catch((err) => {
+        console.error("Status update failed:", err);
+        setInstallments(prevInstallments);
+        if (prevStats) setStats(prevStats);
+        showToast({
+          type: "error",
+          message: `Failed to update status. Changes reverted.`,
+        });
+      });
   };
 
   // Filter list by search query
@@ -213,11 +389,15 @@ function DuesContent() {
         <div className="flex items-center space-x-3">
           <button
             type="button"
-            onClick={fetchDues}
-            disabled={loading}
-            className="inline-flex items-center px-3.5 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 transition-colors shadow-2xs"
+            onClick={() => fetchDues()}
+            disabled={loading || isRefreshing}
+            className="inline-flex items-center px-3.5 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 transition-colors shadow-2xs cursor-pointer"
           >
-            <RefreshCw className={`w-4 h-4 mr-1.5 ${loading ? "animate-spin text-indigo-600" : ""}`} />
+            <RefreshCw
+              className={`w-4 h-4 mr-1.5 ${
+                loading || isRefreshing ? "animate-spin text-indigo-600" : ""
+              }`}
+            />
             Refresh
           </button>
           <Link
@@ -351,7 +531,7 @@ function DuesContent() {
                 key={tab.key}
                 type="button"
                 onClick={() => setStatusTab(tab.key)}
-                className={`inline-flex items-center px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors ${
+                className={`inline-flex items-center px-3.5 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors cursor-pointer ${
                   active
                     ? "bg-indigo-600 text-white shadow-xs"
                     : "text-gray-600 hover:text-gray-900 hover:bg-gray-100"
@@ -405,7 +585,7 @@ function DuesContent() {
 
       {/* Dues List / Table */}
       <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
-        {loading ? (
+        {loading && installments.length === 0 ? (
           <div className="p-12 text-center text-gray-500">
             <RefreshCw className="w-6 h-6 animate-spin mx-auto text-indigo-600 mb-2" />
             Loading dues...
@@ -428,8 +608,10 @@ function DuesContent() {
               return (
                 <div
                   key={item.id}
-                  className={`p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-colors ${
-                    isOverdue
+                  className={`p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-all duration-150 ${
+                    isPaid
+                      ? "bg-emerald-50/20 hover:bg-emerald-50/40"
+                      : isOverdue
                       ? "bg-red-50/40 hover:bg-red-50/70"
                       : isDueToday
                       ? "bg-amber-50/40 hover:bg-amber-50/70"
@@ -439,7 +621,7 @@ function DuesContent() {
                   {/* Left: Borrower & Installment Info */}
                   <div className="flex items-start space-x-3.5">
                     <div
-                      className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${
+                      className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 transition-colors ${
                         isPaid
                           ? "bg-emerald-100 text-emerald-700"
                           : isOverdue
@@ -497,7 +679,8 @@ function DuesContent() {
                         )}
 
                         {isPaid && item.paidAt && (
-                          <span className="px-2 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-800">
+                          <span className="px-2 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-800 flex items-center">
+                            <CheckCircle2 className="w-3 h-3 mr-1 text-emerald-600" />
                             Paid on {formatReadableDate(item.paidAt)}
                           </span>
                         )}
@@ -509,7 +692,7 @@ function DuesContent() {
                   <div className="flex items-center justify-between sm:justify-end space-x-4 border-t sm:border-t-0 pt-3 sm:pt-0">
                     <div className="text-left sm:text-right">
                       <div
-                        className={`text-lg sm:text-xl font-bold ${
+                        className={`text-lg sm:text-xl font-bold transition-colors ${
                           isPaid
                             ? "text-emerald-700"
                             : isOverdue
@@ -525,9 +708,28 @@ function DuesContent() {
                     </div>
 
                     {/* Action Buttons */}
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center space-x-1.5 sm:space-x-2">
                       {!isPaid ? (
                         <>
+                          {/* 1-Click Fast Mark Paid Button (Instant UI Update + Background Save) */}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const todayIso = new Date().toISOString().split("T")[0];
+                              performMarkPaid(
+                                item,
+                                todayIso,
+                                `EMI #${item.installmentNo} for ${item.loan.borrower.name}`
+                              );
+                            }}
+                            className="inline-flex items-center px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95 transition-all shadow-2xs cursor-pointer"
+                            title="Mark paid with today's date instantly"
+                          >
+                            <CheckCircle2 className="w-4 h-4 mr-1" />
+                            Mark Paid
+                          </button>
+
+                          {/* Secondary button to open modal for custom date or note */}
                           <button
                             type="button"
                             onClick={() => {
@@ -535,18 +737,17 @@ function DuesContent() {
                               setPayDate(new Date().toISOString().split("T")[0]);
                               setPayNote(`EMI #${item.installmentNo} for ${item.loan.borrower.name}`);
                             }}
-                            className="inline-flex items-center px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold text-white bg-emerald-600 hover:bg-emerald-700 transition-colors shadow-2xs"
+                            className="p-1.5 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-lg transition-colors border border-gray-200 cursor-pointer"
+                            title="Mark paid with custom date or note..."
                           >
-                            <CheckCircle2 className="w-4 h-4 mr-1" />
-                            Mark Paid
+                            <FileText className="w-3.5 h-3.5" />
                           </button>
 
                           {item.status === "PENDING" && (
                             <button
                               type="button"
-                              disabled={actionLoadingId === item.id}
-                              onClick={() => handleStatusChange(item.id, "OVERDUE")}
-                              className="inline-flex items-center px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-700 bg-red-100 hover:bg-red-200 transition-colors"
+                              onClick={() => handleStatusChangeOptimistic(item.id, "OVERDUE")}
+                              className="inline-flex items-center px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-700 bg-red-100 hover:bg-red-200 active:scale-95 transition-all cursor-pointer"
                               title="Mark this 1 EMI as overdue"
                             >
                               Mark Overdue
@@ -556,9 +757,8 @@ function DuesContent() {
                           {item.status === "OVERDUE" && (
                             <button
                               type="button"
-                              disabled={actionLoadingId === item.id}
-                              onClick={() => handleStatusChange(item.id, "PENDING")}
-                              className="inline-flex items-center px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 transition-colors"
+                              onClick={() => handleStatusChangeOptimistic(item.id, "PENDING")}
+                              className="inline-flex items-center px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 active:scale-95 transition-all cursor-pointer"
                               title="Revert back to pending"
                             >
                               Revert
@@ -566,22 +766,28 @@ function DuesContent() {
                           )}
                         </>
                       ) : (
-                        <button
-                          type="button"
-                          disabled={actionLoadingId === item.id}
-                          onClick={() => {
-                            if (
-                              confirm(
-                                `Revert EMI #${item.installmentNo} back to Pending? This will delete the recorded payment.`
-                              )
-                            ) {
-                              handleStatusChange(item.id, "PENDING");
-                            }
-                          }}
-                          className="inline-flex items-center px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-500 hover:text-red-600 hover:bg-red-50 transition-colors"
-                        >
-                          Undo Paid
-                        </button>
+                        <div className="flex items-center space-x-2">
+                          <span className="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold bg-emerald-100 text-emerald-800">
+                            <CheckCircle2 className="w-3.5 h-3.5 mr-1 text-emerald-600" />
+                            Settled
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (
+                                confirm(
+                                  `Revert EMI #${item.installmentNo} back to Pending? This will delete the recorded payment.`
+                                )
+                              ) {
+                                handleStatusChangeOptimistic(item.id, "PENDING");
+                              }
+                            }}
+                            className="inline-flex items-center px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-500 hover:text-red-600 hover:bg-red-50 active:scale-95 transition-all cursor-pointer"
+                            title="Undo and revert back to Pending"
+                          >
+                            Undo Paid
+                          </button>
+                        </div>
                       )}
 
                       <Link
@@ -600,7 +806,7 @@ function DuesContent() {
         )}
       </div>
 
-      {/* Record Payment Dialog Modal */}
+      {/* Record Payment Dialog Modal (for custom date / note) */}
       {payModalItem && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs animate-in fade-in duration-100">
           <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-gray-200 p-6 space-y-5 animate-in zoom-in-95 duration-100">
@@ -614,7 +820,7 @@ function DuesContent() {
               <button
                 type="button"
                 onClick={() => setPayModalItem(null)}
-                className="p-1 text-gray-400 hover:text-gray-600 rounded-lg"
+                className="p-1 text-gray-400 hover:text-gray-600 rounded-lg cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -672,20 +878,74 @@ function DuesContent() {
               <button
                 type="button"
                 onClick={() => setPayModalItem(null)}
-                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 type="button"
-                onClick={handleMarkPaidConfirm}
-                disabled={submittingPay}
-                className="px-5 py-2 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors shadow-xs"
+                onClick={() => {
+                  if (!payModalItem) return;
+                  performMarkPaid(payModalItem, payDate, payNote);
+                }}
+                className="px-5 py-2 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95 rounded-lg transition-all shadow-xs cursor-pointer"
               >
-                {submittingPay ? "Saving..." : "Confirm & Mark as Paid"}
+                Confirm & Mark as Paid
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Modern Floating Toast Notification System */}
+      {toasts.length > 0 && (
+        <div className="fixed bottom-5 right-5 z-50 flex flex-col space-y-2 pointer-events-none max-w-sm w-full">
+          {toasts.map((toast) => (
+            <div
+              key={toast.id}
+              className={`pointer-events-auto p-3.5 rounded-xl shadow-xl border flex items-center justify-between space-x-3 animate-in slide-in-from-bottom-3 duration-200 ${
+                toast.type === "success"
+                  ? "bg-gray-900 text-white border-emerald-500/40"
+                  : toast.type === "error"
+                  ? "bg-red-950 text-white border-red-800"
+                  : "bg-gray-900 text-white border-gray-800"
+              }`}
+            >
+              <div className="flex items-center space-x-2 text-xs sm:text-sm">
+                {toast.type === "success" && (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                )}
+                {toast.type === "error" && (
+                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                )}
+                {toast.type === "info" && (
+                  <Clock className="w-4 h-4 text-blue-400 shrink-0" />
+                )}
+                <span className="font-medium">{toast.message}</span>
+              </div>
+              <div className="flex items-center space-x-2 shrink-0">
+                {toast.action && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      toast.action?.onClick();
+                      removeToast(toast.id);
+                    }}
+                    className="text-xs font-bold text-emerald-400 hover:text-white underline underline-offset-2 px-1 py-0.5 cursor-pointer"
+                  >
+                    {toast.action.label}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => removeToast(toast.id)}
+                  className="text-gray-400 hover:text-white p-0.5 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>
