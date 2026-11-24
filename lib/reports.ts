@@ -1,8 +1,8 @@
 import { prisma } from "./prisma";
 import { calculateLoanDetails } from "./calculations";
-import { computeNextDueDate, getNowInKolkata, formatToKolkataDateString } from "./dates";
+import { getNowInKolkata, formatToKolkataDateString } from "./dates";
 import { formatReadableDate } from "./format";
-import { syncOverdueInstallments } from "./installments";
+import { syncOverdueInstallments, calculateLoanDueStatus } from "./installments";
 import {
   sendOwnerConsolidatedReport,
   sendBorrowerReminder,
@@ -97,10 +97,10 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
       monthlyCycleDueDec = new Decimal(loan.monthlyAmount || 0);
     }
 
-    // Compute tentative next due date
-    const tentativeDue = computeNextDueDate(loan.startDate, loan.dueDay, today, false);
-    const daysUntilDue = tentativeDue.daysUntilDue;
-    const dueDateObj = tentativeDue.dueDate;
+    // Compute authoritative next due date & status
+    const dueStatus = calculateLoanDueStatus(loan, calc, today);
+    const daysUntilDue = dueStatus.daysUntilDue;
+    const dueDateObj = dueStatus.dueDate || today;
 
     // Check overdue installments for EMI loans
     const overdueInsts = loan.installments.filter((inst) => inst.status === "OVERDUE");
@@ -122,9 +122,9 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
     let statusType: "OVERDUE" | "DUE_TODAY" | "DUE_SOON" | "NORMAL" = "NORMAL";
     let statusText = `Next due in ${daysUntilDue}d`;
 
-    const isLoanOverdue = daysUntilDue < 0 || overdueInstallmentItems.length > 0;
-    const isDueToday = daysUntilDue === 0;
-    const isDueSoon = daysUntilDue > 0 && loan.remindDaysBefore.includes(daysUntilDue);
+    const isLoanOverdue = dueStatus.isOverdue;
+    const isDueToday = !isLoanOverdue && daysUntilDue === 0;
+    const isDueSoon = !isLoanOverdue && daysUntilDue > 0 && loan.remindDaysBefore.includes(daysUntilDue);
 
     // Calculate Overdue and Next Month Due (installments only)
     let loanOverdueAmount = new Decimal(0);
@@ -134,7 +134,7 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
       for (const inst of overdueInstallmentItems) {
         loanOverdueAmount = loanOverdueAmount.plus(inst.amount);
       }
-    } else if (daysUntilDue < 0) {
+    } else if (isLoanOverdue) {
       loanOverdueAmount = monthlyCycleDueDec;
     }
 
@@ -291,7 +291,7 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
       remainingAmount: owedDec.toFixed(2),
       monthlyCycleDue: monthlyCycleDueDec.toFixed(2),
       dueDate: dueDateObj,
-      dueDateFormatted: tentativeDue.dueDateString,
+      dueDateFormatted: dueStatus.nextDueDate,
       daysUntilDue,
       statusText,
       statusType,

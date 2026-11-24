@@ -96,14 +96,14 @@ export default function DashboardPage() {
     return sum + parseFloat(l.calculations.totalInterestPaid || "0");
   }, 0);
 
-  // 4. Overdue Loans (daysUntilDue < 0)
+  // 4. Overdue Loans
   const overdueLoans = activeLoans
-    .filter((l) => l.isOverdue || l.daysUntilDue < 0)
+    .filter((l) => l.isOverdue)
     .sort((a, b) => a.daysUntilDue - b.daysUntilDue);
 
   // 5. Upcoming Dues in next 7 days (daysUntilDue >= 0 && daysUntilDue <= 7)
   const duesNext7Days = activeLoans.filter(
-    (l) => l.daysUntilDue >= 0 && l.daysUntilDue <= 7
+    (l) => !l.isOverdue && l.daysUntilDue >= 0 && l.daysUntilDue <= 7
   );
   const duesNext7DaysAmount = duesNext7Days.reduce((sum, l) => {
     const amt =
@@ -117,7 +117,7 @@ export default function DashboardPage() {
 
   // Upcoming dues list (due in next 30 days)
   const upcomingDues = activeLoans
-    .filter((l) => l.daysUntilDue >= 0)
+    .filter((l) => !l.isOverdue && l.daysUntilDue >= 0)
     .sort((a, b) => a.daysUntilDue - b.daysUntilDue);
 
   return (

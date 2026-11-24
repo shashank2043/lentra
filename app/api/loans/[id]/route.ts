@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { loanUpdateSchema } from "@/lib/validations";
 import { calculateLoanDetails } from "@/lib/calculations";
-import { computeNextDueDate } from "@/lib/dates";
+import { calculateLoanDueStatus, syncOverdueInstallments } from "@/lib/installments";
 import { Prisma } from "@prisma/client";
 
 export async function GET(
@@ -10,6 +10,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    await syncOverdueInstallments();
     const { id } = await params;
 
     const loan = await prisma.loan.findUnique({
@@ -35,14 +36,14 @@ export async function GET(
     }
 
     const calculations = calculateLoanDetails(loan, loan.payments);
-    const nextDue = computeNextDueDate(loan.startDate, loan.dueDay);
+    const dueStatus = calculateLoanDueStatus(loan, calculations);
 
     return NextResponse.json({
       ...loan,
       calculations,
-      nextDueDate: nextDue.dueDateString,
-      isOverdue: nextDue.isOverdue && loan.status === "ACTIVE",
-      daysUntilDue: nextDue.daysUntilDue,
+      nextDueDate: dueStatus.nextDueDate,
+      isOverdue: dueStatus.isOverdue,
+      daysUntilDue: dueStatus.daysUntilDue,
     });
   } catch (error) {
     console.error("Error fetching loan details:", error);

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { calculateLoanDetails } from "@/lib/calculations";
-import { computeNextDueDate } from "@/lib/dates";
+import { calculateLoanDueStatus } from "@/lib/installments";
 import { sendOwnerReminder, sendBorrowerReminder } from "@/lib/email";
 
 export async function POST(
@@ -16,6 +16,9 @@ export async function POST(
       include: {
         borrower: true,
         payments: true,
+        installments: {
+          orderBy: { installmentNo: "asc" },
+        },
       },
     });
 
@@ -24,7 +27,7 @@ export async function POST(
     }
 
     const calculations = calculateLoanDetails(loan, loan.payments);
-    const nextDue = computeNextDueDate(loan.startDate, loan.dueDay);
+    const dueStatus = calculateLoanDueStatus(loan, calculations);
 
     // Amount due based on loan type
     let amountDue = "0";
@@ -48,11 +51,11 @@ export async function POST(
       borrowerName: loan.borrower.name,
       loanType: loan.type,
       amountDue,
-      dueDate: nextDue.dueDate,
+      dueDate: dueStatus.dueDate || new Date(),
       outstandingBalance,
       loanId: loan.id,
-      triggerType: nextDue.isOverdue ? "OVERDUE" : "ON_DAY",
-      daysLeft: nextDue.daysUntilDue,
+      triggerType: dueStatus.isOverdue ? "OVERDUE" : "ON_DAY",
+      daysLeft: dueStatus.daysUntilDue,
       appUrl: origin,
     });
 
@@ -62,7 +65,7 @@ export async function POST(
         borrowerName: loan.borrower.name,
         borrowerEmail: loan.borrower.email,
         amountDue,
-        dueDate: nextDue.dueDate,
+        dueDate: dueStatus.dueDate || new Date(),
         triggerType: "ON_DAY",
       });
     }

@@ -1,5 +1,12 @@
 import { prisma } from "./prisma";
-import { getNowInKolkata, getClampedDueDate, parseKolkataDate, formatToKolkataDateString } from "./dates";
+import {
+  getNowInKolkata,
+  getClampedDueDate,
+  parseKolkataDate,
+  formatToKolkataDateString,
+  getCalendarDayDifference,
+  computeNextDueDate,
+} from "./dates";
 import Decimal from "decimal.js";
 
 /**
@@ -368,4 +375,158 @@ export async function updateInstallmentStatus(
       },
     });
   });
+}
+
+export interface LoanDueStatus {
+  dueDate: Date | null;
+  nextDueDate: string; // YYYY-MM-DD or ""
+  isOverdue: boolean;
+  daysUntilDue: number;
+}
+
+/**
+ * Calculates the authoritative due and overdue status for a loan across all loan types.
+ * Synchronizes with EMI installment schedules and payment history to ensure Dashboard
+ * and Due Management remain in 100% agreement.
+ */
+export function calculateLoanDueStatus(
+  loan: {
+    type: string;
+    status: string;
+    startDate: Date | string;
+    dueDay: number;
+    installments?: Array<{
+      id?: string;
+      installmentNo?: number;
+      amount?: any;
+      dueDate: Date | string;
+      status: string;
+    }>;
+  },
+  calculations?: {
+    isAutoClosed?: boolean;
+    monthsInterestPaid?: number;
+  },
+  today: Date = getNowInKolkata()
+): LoanDueStatus {
+  const todayStr = formatToKolkataDateString(today);
+  const [todayYear, todayMonth] = todayStr.split("-").map(Number);
+
+  // 1. Closed or auto-closed loans
+  if (loan.status === "CLOSED" || calculations?.isAutoClosed) {
+    return {
+      dueDate: null,
+      nextDueDate: "",
+      isOverdue: false,
+      daysUntilDue: 999,
+    };
+  }
+
+  // 2. Loans with installments (EMI, INTEREST_FREE)
+  if (loan.installments && loan.installments.length > 0) {
+    const overdue = loan.installments.filter((inst) => inst.status === "OVERDUE");
+    if (overdue.length > 0) {
+      overdue.sort(
+        (a, b) => new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime()
+      );
+      const earliest = overdue[0];
+      const dueDateStr = formatToKolkataDateString(earliest.dueDate);
+      const days = getCalendarDayDifference(dueDateStr, todayStr);
+      return {
+        dueDate: parseKolkataDate(dueDateStr),
+        nextDueDate: dueDateStr,
+        isOverdue: true,
+        daysUntilDue: Math.min(-1, days),
+      };
+    }
+
+    const pending = loan.installments.filter((inst) => inst.status === "PENDING");
+    if (pending.length > 0) {
+      pending.sort(
+        (a, b) => new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime()
+      );
+      const earliest = pending[0];
+      const dueDateStr = formatToKolkataDateString(earliest.dueDate);
+      const days = getCalendarDayDifference(dueDateStr, todayStr);
+      return {
+        dueDate: parseKolkataDate(dueDateStr),
+        nextDueDate: dueDateStr,
+        isOverdue: days < 0,
+        daysUntilDue: days,
+      };
+    }
+
+    // All installments paid
+    return {
+      dueDate: null,
+      nextDueDate: "",
+      isOverdue: false,
+      daysUntilDue: 999,
+    };
+  }
+
+  // 3. FLEXIBLE loans: No fixed schedules or overdue penalties
+  if (loan.type === "FLEXIBLE") {
+    let candidate = getClampedDueDate(todayYear, todayMonth, loan.dueDay);
+    if (todayStr > formatToKolkataDateString(candidate)) {
+      const nextM = todayMonth === 12 ? 1 : todayMonth + 1;
+      const nextY = todayMonth === 12 ? todayYear + 1 : todayYear;
+      candidate = getClampedDueDate(nextY, nextM, loan.dueDay);
+    }
+    const candidateStr = formatToKolkataDateString(candidate);
+    const days = Math.max(0, getCalendarDayDifference(candidateStr, todayStr));
+    return {
+      dueDate: candidate,
+      nextDueDate: candidateStr,
+      isOverdue: false,
+      daysUntilDue: days,
+    };
+  }
+
+  // 4. INTEREST_ONLY loans
+  if (loan.type === "INTEREST_ONLY") {
+    const paidCycles = Math.floor(calculations?.monthsInterestPaid || 0);
+    const startD = typeof loan.startDate === "string" ? new Date(loan.startDate) : loan.startDate;
+    const startStr = formatToKolkataDateString(startD);
+    const [startYear, startMonth] = startStr.split("-").map(Number);
+
+    const firstDueThisMonth = getClampedDueDate(startYear, startMonth, loan.dueDay);
+    let cycle0Year = startYear;
+    let cycle0Month = startMonth;
+
+    if (startStr > formatToKolkataDateString(firstDueThisMonth)) {
+      if (cycle0Month === 12) {
+        cycle0Year += 1;
+        cycle0Month = 1;
+      } else {
+        cycle0Month += 1;
+      }
+    }
+
+    let targetMonth = cycle0Month + paidCycles;
+    let targetYear = cycle0Year;
+    while (targetMonth > 12) {
+      targetMonth -= 12;
+      targetYear += 1;
+    }
+
+    const candidate = getClampedDueDate(targetYear, targetMonth, loan.dueDay);
+    const candidateStr = formatToKolkataDateString(candidate);
+    const days = getCalendarDayDifference(candidateStr, todayStr);
+    return {
+      dueDate: candidate,
+      nextDueDate: candidateStr,
+      isOverdue: days < 0,
+      daysUntilDue: days,
+    };
+  }
+
+  // Fallback for EMI / other loans without installments loaded
+  const nextDue = computeNextDueDate(loan.startDate, loan.dueDay, today);
+  return {
+    dueDate: nextDue.dueDate,
+    nextDueDate: nextDue.dueDateString,
+    isOverdue: nextDue.isOverdue && loan.status === "ACTIVE",
+    daysUntilDue: nextDue.daysUntilDue,
+  };
 }

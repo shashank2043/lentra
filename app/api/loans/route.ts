@@ -2,12 +2,18 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { loanCreateSchema } from "@/lib/validations";
 import { calculateLoanDetails } from "@/lib/calculations";
-import { computeNextDueDate } from "@/lib/dates";
-import { generateLoanSchedule } from "@/lib/installments";
+import {
+  generateLoanSchedule,
+  syncOverdueInstallments,
+  calculateLoanDueStatus,
+} from "@/lib/installments";
 import { Prisma } from "@prisma/client";
 
 export async function GET(request: NextRequest) {
   try {
+    // 1. Sync overdue installments before reading
+    await syncOverdueInstallments();
+
     const { searchParams } = new URL(request.url);
     const borrowerId = searchParams.get("borrowerId");
     const type = searchParams.get("type");
@@ -35,19 +41,22 @@ export async function GET(request: NextRequest) {
         payments: {
           orderBy: { paidOn: "desc" },
         },
+        installments: {
+          orderBy: { installmentNo: "asc" },
+        },
       },
     });
 
     const loansWithCalculations = loans.map((loan) => {
       const calculations = calculateLoanDetails(loan, loan.payments);
-      const nextDue = computeNextDueDate(loan.startDate, loan.dueDay);
+      const dueStatus = calculateLoanDueStatus(loan, calculations);
 
       return {
         ...loan,
         calculations,
-        nextDueDate: nextDue.dueDateString,
-        isOverdue: nextDue.isOverdue && loan.status === "ACTIVE",
-        daysUntilDue: nextDue.daysUntilDue,
+        nextDueDate: dueStatus.nextDueDate,
+        isOverdue: dueStatus.isOverdue,
+        daysUntilDue: dueStatus.daysUntilDue,
       };
     });
 
