@@ -29,6 +29,7 @@ export async function GET(request: NextRequest) {
       totalActiveLoans: result.reportData.totalActiveLoans,
       totalOutstandingOwed: result.reportData.totalOutstandingOwed,
       totalOverdueAmount: result.reportData.totalOverdueAmount,
+      totalDueNextMonth: result.reportData.totalDueNextMonth,
       totalDueTodayAmount: result.reportData.totalDueTodayAmount,
       timestamp: new Date().toISOString(),
     });

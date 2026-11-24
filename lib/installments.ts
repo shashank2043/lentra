@@ -222,6 +222,105 @@ export async function markInstallmentAsPaid(
   });
 }
 
+export interface BulkSettleItemInput {
+  id: string;
+  paidOn?: Date | string;
+  note?: string;
+}
+
+/**
+ * Marks multiple installments as PAID in a single atomic transaction.
+ * Supports different or identical paidOn dates and notes per installment.
+ */
+export async function markMultipleInstallmentsAsPaid(items: BulkSettleItemInput[]) {
+  if (!items || items.length === 0) {
+    return { count: 0, installments: [] };
+  }
+
+  return prisma.$transaction(async (tx) => {
+    const updatedInstallments = [];
+    const loanIdsToCheck = new Set<string>();
+
+    for (const item of items) {
+      const installment = await tx.emiInstallment.findUnique({
+        where: { id: item.id },
+        select: {
+          id: true,
+          loanId: true,
+          installmentNo: true,
+          amount: true,
+          dueDate: true,
+          status: true,
+        },
+      });
+
+      if (!installment || installment.status === "PAID") {
+        continue;
+      }
+
+      const paidDate = item.paidOn
+        ? typeof item.paidOn === "string"
+          ? new Date(item.paidOn)
+          : item.paidOn
+        : getNowInKolkata();
+
+      // Create Payment record
+      const payment = await tx.payment.create({
+        data: {
+          loanId: installment.loanId,
+          amount: installment.amount,
+          paidOn: paidDate,
+          kind: "INSTALLMENT",
+          note:
+            item.note ||
+            `Payment for EMI #${installment.installmentNo} (Due ${formatToKolkataDateString(
+              installment.dueDate
+            )})`,
+        },
+      });
+
+      // Update Installment to PAID
+      const updated = await tx.emiInstallment.update({
+        where: { id: item.id },
+        data: {
+          status: "PAID",
+          paidAt: paidDate,
+          paymentId: payment.id,
+        },
+        include: {
+          loan: { include: { borrower: true } },
+          payment: true,
+        },
+      });
+
+      updatedInstallments.push(updated);
+      loanIdsToCheck.add(installment.loanId);
+    }
+
+    // Check if affected loans are now fully paid off and should be CLOSED
+    for (const loanId of loanIdsToCheck) {
+      const remainingUnpaid = await tx.emiInstallment.count({
+        where: {
+          loanId,
+          status: { in: ["PENDING", "OVERDUE"] },
+        },
+      });
+
+      if (remainingUnpaid === 0) {
+        await tx.loan.update({
+          where: { id: loanId },
+          data: { status: "CLOSED" },
+        });
+      }
+    }
+
+    return {
+      count: updatedInstallments.length,
+      installments: updatedInstallments,
+    };
+  });
+}
+
 /**
  * Manually updates status of 1 EMI installment (e.g. to OVERDUE or back to PENDING).
  */

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateAndSendConsolidatedReport } from "@/lib/reports";
+import { formatINR } from "@/lib/format";
 
 export async function POST(request: NextRequest) {
   try {
@@ -24,7 +25,9 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: `Single summary report sent successfully to ${ownerEmail}! Contains ${result.reportData.totalBorrowers} borrower(s) and ₹${result.reportData.totalOutstandingOwed} total owed.`,
+      message: `Single summary report sent successfully to ${ownerEmail}! Total Due Next Month: ${formatINR(
+        result.reportData.totalDueNextMonth
+      )} • Total Overdue: ${formatINR(result.reportData.totalOverdueAmount)}.`,
       reportData: result.reportData,
     });
   } catch (error: any) {

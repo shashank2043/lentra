@@ -48,6 +48,8 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
     totalPaid: Decimal;
     totalOwed: Decimal;
     totalDueNow: Decimal;
+    totalDueNextMonth: Decimal;
+    totalOverdue: Decimal;
     status: "OVERDUE" | "DUE_TODAY" | "DUE_SOON" | "NORMAL";
     loans: LoanReportItem[];
   }>();
@@ -57,10 +59,13 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
   let globalOutstandingOwed = new Decimal(0);
   let globalOverdueAmount = new Decimal(0);
   let globalDueTodayAmount = new Decimal(0);
+  let globalDueNextMonth = new Decimal(0);
   let globalOverdueCount = 0;
   let globalDueTodayCount = 0;
 
   const overdueInstallmentIdsToUpdate: string[] = [];
+  const thirtyOneDaysMs = 31 * 24 * 60 * 60 * 1000;
+  const nextMonthEnd = new Date(today.getTime() + thirtyOneDaysMs);
 
   for (const loan of activeLoans) {
     const calc = calculateLoanDetails(loan, loan.payments);
@@ -121,20 +126,44 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
     const isDueToday = daysUntilDue === 0;
     const isDueSoon = daysUntilDue > 0 && loan.remindDaysBefore.includes(daysUntilDue);
 
+    // Calculate Overdue and Next Month Due (installments only)
+    let loanOverdueAmount = new Decimal(0);
+    let loanNextMonthInstallments = new Decimal(0);
+
+    if (overdueInstallmentItems.length > 0) {
+      for (const inst of overdueInstallmentItems) {
+        loanOverdueAmount = loanOverdueAmount.plus(inst.amount);
+      }
+    } else if (daysUntilDue < 0) {
+      loanOverdueAmount = monthlyCycleDueDec;
+    }
+
+    if (loan.type === "EMI" || loan.type === "INTEREST_FREE") {
+      const upcomingInsts = loan.installments.filter((inst) => {
+        if (inst.status !== "PENDING") return false;
+        const dTime = new Date(inst.dueDate).getTime();
+        return dTime >= today.getTime() - 24 * 60 * 60 * 1000 && dTime <= nextMonthEnd.getTime();
+      });
+
+      if (upcomingInsts.length > 0) {
+        for (const inst of upcomingInsts) {
+          loanNextMonthInstallments = loanNextMonthInstallments.plus(inst.amount);
+        }
+      } else if (daysUntilDue >= 0 && daysUntilDue <= 31 && loan.monthlyAmount) {
+        loanNextMonthInstallments = new Decimal(loan.monthlyAmount);
+      }
+    } else if (loan.type === "INTEREST_ONLY") {
+      if (daysUntilDue >= 0 && daysUntilDue <= 31) {
+        loanNextMonthInstallments = monthlyCycleDueDec;
+      }
+    }
+
     if (isLoanOverdue) {
       statusType = "OVERDUE";
       const delayDays = daysUntilDue < 0 ? Math.abs(daysUntilDue) : (overdueInstallmentItems[0]?.daysOverdue || 1);
       statusText = `OVERDUE by ${delayDays}d`;
       globalOverdueCount++;
-
-      // Overdue amount calculation
-      if (overdueInstallmentItems.length > 0) {
-        for (const inst of overdueInstallmentItems) {
-          globalOverdueAmount = globalOverdueAmount.plus(inst.amount);
-        }
-      } else {
-        globalOverdueAmount = globalOverdueAmount.plus(monthlyCycleDueDec);
-      }
+      globalOverdueAmount = globalOverdueAmount.plus(loanOverdueAmount);
     } else if (isDueToday) {
       statusType = "DUE_TODAY";
       statusText = "DUE TODAY";
@@ -144,6 +173,8 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
       statusType = "DUE_SOON";
       statusText = `Due in ${daysUntilDue}d`;
     }
+
+    globalDueNextMonth = globalDueNextMonth.plus(loanNextMonthInstallments);
 
     // Borrower reminders handling (sent ONLY to borrower email, NEVER to owner email)
     if (
@@ -228,6 +259,8 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
         totalPaid: new Decimal(0),
         totalOwed: new Decimal(0),
         totalDueNow: new Decimal(0),
+        totalDueNextMonth: new Decimal(0),
+        totalOverdue: new Decimal(0),
         status: "NORMAL",
         loans: [],
       });
@@ -237,6 +270,8 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
     bData.totalPrincipal = bData.totalPrincipal.plus(principalDec);
     bData.totalPaid = bData.totalPaid.plus(paidDec);
     bData.totalOwed = bData.totalOwed.plus(owedDec);
+    bData.totalDueNextMonth = bData.totalDueNextMonth.plus(loanNextMonthInstallments);
+    bData.totalOverdue = bData.totalOverdue.plus(loanOverdueAmount);
 
     if (isLoanOverdue) {
       bData.status = "OVERDUE";
@@ -288,6 +323,8 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
       totalPaid: b.totalPaid.toFixed(2),
       totalOwed: b.totalOwed.toFixed(2),
       totalDueNow: b.totalDueNow.toFixed(2),
+      totalDueNextMonth: b.totalDueNextMonth.toFixed(2),
+      totalOverdue: b.totalOverdue.toFixed(2),
       status: b.status,
       loans: b.loans,
     }))
@@ -295,7 +332,13 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
       // 1. Overdue first, then Due Today, then Due Soon, then Normal
       const priorityDiff = statusPriority[a.status] - statusPriority[b.status];
       if (priorityDiff !== 0) return priorityDiff;
-      // 2. Total owed descending
+      // 2. Total overdue descending
+      const overdueDiff = new Decimal(b.totalOverdue).minus(new Decimal(a.totalOverdue)).toNumber();
+      if (overdueDiff !== 0) return overdueDiff;
+      // 3. Next month due descending
+      const nextMonthDiff = new Decimal(b.totalDueNextMonth).minus(new Decimal(a.totalDueNextMonth)).toNumber();
+      if (nextMonthDiff !== 0) return nextMonthDiff;
+      // 4. Total owed descending
       return new Decimal(b.totalOwed).minus(new Decimal(a.totalOwed)).toNumber();
     });
 
@@ -312,6 +355,7 @@ export async function generateAndSendConsolidatedReport(options: ReportOptions =
     totalCollected: globalCollected.toFixed(2),
     totalOutstandingOwed: globalOutstandingOwed.toFixed(2),
     totalOverdueAmount: globalOverdueAmount.toFixed(2),
+    totalDueNextMonth: globalDueNextMonth.toFixed(2),
     totalDueTodayAmount: globalDueTodayAmount.toFixed(2),
     overdueCount: globalOverdueCount,
     dueTodayCount: globalDueTodayCount,

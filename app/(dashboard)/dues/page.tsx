@@ -18,6 +18,13 @@ import {
   FileText,
   User,
   RotateCcw,
+  CheckSquare,
+  Square,
+  MinusSquare,
+  Sliders,
+  Layers,
+  Sparkles,
+  Check,
 } from "lucide-react";
 import { formatINR, formatReadableDate } from "@/lib/format";
 
@@ -372,6 +379,225 @@ function DuesContent() {
     );
   });
 
+  // Bulk selection & settlement state
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
+  const [bulkMode, setBulkMode] = useState<"SAME" | "INDIVIDUAL">("SAME");
+  const [bulkCommonDate, setBulkCommonDate] = useState<string>(
+    new Date().toISOString().split("T")[0]
+  );
+  const [bulkCommonNote, setBulkCommonNote] = useState<string>("Settlement via UPI");
+  const [bulkItemConfigs, setBulkItemConfigs] = useState<
+    Record<string, { paidOn: string; note: string }>
+  >({});
+  const [bulkSubmitting, setBulkSubmitting] = useState(false);
+
+  // Selected items & totals
+  const selectedItems = installments.filter((item) => selectedIds.includes(item.id));
+  const totalSelectedAmount = selectedItems.reduce(
+    (sum, item) => sum + (parseFloat(item.amount) || 0),
+    0
+  );
+
+  const selectableInstallments = filteredInstallments.filter((item) => item.status !== "PAID");
+  const isAllSelected =
+    selectableInstallments.length > 0 &&
+    selectableInstallments.every((item) => selectedIds.includes(item.id));
+  const isSomeSelected = selectedIds.length > 0 && !isAllSelected;
+
+  const toggleSelectAll = () => {
+    if (isAllSelected) {
+      setSelectedIds([]);
+    } else {
+      setSelectedIds(selectableInstallments.map((i) => i.id));
+    }
+  };
+
+  const toggleSelectOne = (id: string) => {
+    setSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  const selectOverdueOnly = () => {
+    const overdueIds = filteredInstallments
+      .filter((item) => item.status === "OVERDUE")
+      .map((item) => item.id);
+    setSelectedIds(overdueIds);
+  };
+
+  const selectDueTodayOnly = () => {
+    const todayIds = filteredInstallments
+      .filter((item) => item.isDueToday && item.status !== "PAID")
+      .map((item) => item.id);
+    setSelectedIds(todayIds);
+  };
+
+  const clearSelection = () => {
+    setSelectedIds([]);
+  };
+
+  const handleOpenBulkModal = () => {
+    if (selectedIds.length === 0) return;
+    const todayIso = new Date().toISOString().split("T")[0];
+    const initialConfigs: Record<string, { paidOn: string; note: string }> = {};
+
+    for (const item of selectedItems) {
+      initialConfigs[item.id] = {
+        paidOn: todayIso,
+        note: `EMI #${item.installmentNo} for ${item.loan.borrower.name}`,
+      };
+    }
+
+    setBulkItemConfigs(initialConfigs);
+    setBulkCommonDate(todayIso);
+    setBulkCommonNote("Settlement via UPI");
+    setBulkMode("SAME");
+    setIsBulkModalOpen(true);
+  };
+
+  const handleSwitchToIndividual = () => {
+    setBulkItemConfigs((prev) => {
+      const next = { ...prev };
+      for (const item of selectedItems) {
+        next[item.id] = {
+          paidOn: next[item.id]?.paidOn || bulkCommonDate,
+          note:
+            next[item.id]?.note ||
+            bulkCommonNote ||
+            `EMI #${item.installmentNo} for ${item.loan.borrower.name}`,
+        };
+      }
+      return next;
+    });
+    setBulkMode("INDIVIDUAL");
+  };
+
+  const updateIndividualItemConfig = (
+    id: string,
+    field: "paidOn" | "note",
+    value: string
+  ) => {
+    setBulkItemConfigs((prev) => ({
+      ...prev,
+      [id]: {
+        paidOn: prev[id]?.paidOn || bulkCommonDate,
+        note: prev[id]?.note !== undefined ? prev[id].note : "",
+        [field]: value,
+      },
+    }));
+  };
+
+  const handleRemoveFromBulkSelection = (id: string) => {
+    setSelectedIds((prev) => {
+      const remaining = prev.filter((item) => item !== id);
+      if (remaining.length === 0) {
+        setIsBulkModalOpen(false);
+      }
+      return remaining;
+    });
+  };
+
+  const handleConfirmBulkSettle = async () => {
+    if (selectedItems.length === 0) return;
+    setBulkSubmitting(true);
+
+    try {
+      const payloadItems = selectedItems.map((item) => {
+        if (bulkMode === "SAME") {
+          return {
+            id: item.id,
+            paidOn: bulkCommonDate,
+            note:
+              bulkCommonNote.trim() ||
+              `EMI #${item.installmentNo} for ${item.loan.borrower.name}`,
+          };
+        } else {
+          const cfg = bulkItemConfigs[item.id];
+          return {
+            id: item.id,
+            paidOn: cfg?.paidOn || bulkCommonDate,
+            note:
+              cfg?.note?.trim() ||
+              `EMI #${item.installmentNo} for ${item.loan.borrower.name}`,
+          };
+        }
+      });
+
+      const res = await fetch("/api/dues/bulk-pay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: payloadItems }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to settle selected dues");
+      }
+
+      setIsBulkModalOpen(false);
+      setSelectedIds([]);
+
+      showToast({
+        type: "success",
+        message: `Successfully settled ${data.count} dues (${formatINR(totalSelectedAmount)})!`,
+      });
+
+      fetchDues();
+    } catch (err: any) {
+      showToast({
+        type: "error",
+        message: err.message || "Failed to settle dues. Please try again.",
+      });
+    } finally {
+      setBulkSubmitting(false);
+    }
+  };
+
+  const handleQuickSettleAllSelected = async () => {
+    if (selectedItems.length === 0) return;
+    if (
+      !confirm(
+        `Mark ${selectedItems.length} selected dues (${formatINR(
+          totalSelectedAmount
+        )}) as PAID today?`
+      )
+    ) {
+      return;
+    }
+    const todayIso = new Date().toISOString().split("T")[0];
+    const payloadItems = selectedItems.map((item) => ({
+      id: item.id,
+      paidOn: todayIso,
+      note: `EMI #${item.installmentNo} for ${item.loan.borrower.name}`,
+    }));
+
+    try {
+      const res = await fetch("/api/dues/bulk-pay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: payloadItems }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to settle selected dues");
+      }
+
+      setSelectedIds([]);
+      showToast({
+        type: "success",
+        message: `Successfully settled ${data.count} dues (${formatINR(totalSelectedAmount)})!`,
+      });
+      fetchDues();
+    } catch (err: any) {
+      showToast({
+        type: "error",
+        message: err.message || "Failed to settle selected dues",
+      });
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
@@ -599,38 +825,120 @@ function DuesContent() {
             </p>
           </div>
         ) : (
-          <div className="divide-y divide-gray-200">
-            {filteredInstallments.map((item) => {
-              const isOverdue = item.status === "OVERDUE";
-              const isPaid = item.status === "PAID";
-              const isDueToday = item.isDueToday && !isPaid;
-
-              return (
-                <div
-                  key={item.id}
-                  className={`p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-all duration-150 ${
-                    isPaid
-                      ? "bg-emerald-50/20 hover:bg-emerald-50/40"
-                      : isOverdue
-                      ? "bg-red-50/40 hover:bg-red-50/70"
-                      : isDueToday
-                      ? "bg-amber-50/40 hover:bg-amber-50/70"
-                      : "hover:bg-gray-50"
-                  }`}
+          <div>
+            {/* Selection Toolbar inside card header */}
+            <div className="px-4 py-3 bg-gray-50/80 border-b border-gray-200 flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={toggleSelectAll}
+                  disabled={selectableInstallments.length === 0}
+                  className="inline-flex items-center space-x-1.5 font-semibold text-gray-700 hover:text-gray-900 disabled:opacity-40 cursor-pointer"
                 >
-                  {/* Left: Borrower & Installment Info */}
-                  <div className="flex items-start space-x-3.5">
-                    <div
-                      className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 transition-colors ${
-                        isPaid
-                          ? "bg-emerald-100 text-emerald-700"
-                          : isOverdue
-                          ? "bg-red-100 text-red-700"
-                          : isDueToday
-                          ? "bg-amber-100 text-amber-800"
-                          : "bg-indigo-100 text-indigo-700"
-                      }`}
-                    >
+                  {isAllSelected ? (
+                    <CheckSquare className="w-4 h-4 text-indigo-600" />
+                  ) : isSomeSelected ? (
+                    <MinusSquare className="w-4 h-4 text-indigo-600" />
+                  ) : (
+                    <Square className="w-4 h-4 text-gray-400" />
+                  )}
+                  <span>Select All Unpaid ({selectableInstallments.length})</span>
+                </button>
+
+                {selectedIds.length > 0 && (
+                  <span className="text-gray-500">
+                    • <strong className="text-indigo-600 font-bold">{selectedIds.length}</strong> selected ({formatINR(totalSelectedAmount)})
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-center space-x-2">
+                {stats && stats.overdueCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={selectOverdueOnly}
+                    className="px-2.5 py-1 rounded-md text-[11px] font-semibold bg-red-50 text-red-700 hover:bg-red-100 border border-red-200 transition-colors cursor-pointer"
+                  >
+                    Select Overdue ({stats.overdueCount})
+                  </button>
+                )}
+                {stats && stats.dueTodayCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={selectDueTodayOnly}
+                    className="px-2.5 py-1 rounded-md text-[11px] font-semibold bg-amber-50 text-amber-800 hover:bg-amber-100 border border-amber-200 transition-colors cursor-pointer"
+                  >
+                    Select Due Today ({stats.dueTodayCount})
+                  </button>
+                )}
+                {selectedIds.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={clearSelection}
+                    className="px-2 py-1 text-gray-500 hover:text-gray-800 text-[11px] font-medium underline cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="divide-y divide-gray-200">
+              {filteredInstallments.map((item) => {
+                const isOverdue = item.status === "OVERDUE";
+                const isPaid = item.status === "PAID";
+                const isDueToday = item.isDueToday && !isPaid;
+                const isSelected = selectedIds.includes(item.id);
+
+                return (
+                  <div
+                    key={item.id}
+                    className={`p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition-all duration-150 ${
+                      isSelected
+                        ? "bg-indigo-50/70 ring-2 ring-indigo-500/50"
+                        : isPaid
+                        ? "bg-emerald-50/20 hover:bg-emerald-50/40"
+                        : isOverdue
+                        ? "bg-red-50/40 hover:bg-red-50/70"
+                        : isDueToday
+                        ? "bg-amber-50/40 hover:bg-amber-50/70"
+                        : "hover:bg-gray-50"
+                    }`}
+                  >
+                    {/* Left: Checkbox, Borrower & Installment Info */}
+                    <div className="flex items-start space-x-3">
+                      {/* Checkbox for selecting due */}
+                      {!isPaid ? (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleSelectOne(item.id);
+                          }}
+                          className="mt-2.5 text-gray-400 hover:text-indigo-600 focus:outline-hidden cursor-pointer shrink-0"
+                          title={isSelected ? "Deselect due" : "Select due to settle"}
+                        >
+                          {isSelected ? (
+                            <CheckSquare className="w-5 h-5 text-indigo-600" />
+                          ) : (
+                            <Square className="w-5 h-5 text-gray-300 hover:text-gray-400" />
+                          )}
+                        </button>
+                      ) : (
+                        <div className="w-5 mt-2.5 shrink-0" />
+                      )}
+
+                      <div
+                        className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 transition-colors ${
+                          isPaid
+                            ? "bg-emerald-100 text-emerald-700"
+                            : isOverdue
+                            ? "bg-red-100 text-red-700"
+                            : isDueToday
+                            ? "bg-amber-100 text-amber-800"
+                            : "bg-indigo-100 text-indigo-700"
+                        }`}
+                      >
                       {isPaid ? (
                         <CheckCircle2 className="w-5 h-5" />
                       ) : isOverdue ? (
@@ -802,6 +1110,7 @@ function DuesContent() {
                 </div>
               );
             })}
+            </div>
           </div>
         )}
       </div>
@@ -892,6 +1201,335 @@ function DuesContent() {
               >
                 Confirm & Mark as Paid
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Bottom Bulk Action Bar */}
+      {selectedIds.length > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 max-w-xl w-[94%] sm:w-full bg-gray-950 text-white rounded-2xl shadow-2xl p-4 border border-gray-800 flex flex-col sm:flex-row items-center justify-between gap-3 animate-in slide-in-from-bottom-5 duration-200">
+          <div className="flex items-center space-x-3 w-full sm:w-auto">
+            <div className="w-10 h-10 rounded-xl bg-indigo-600/30 border border-indigo-500/40 flex items-center justify-center text-indigo-400 font-extrabold text-sm shrink-0">
+              {selectedIds.length}
+            </div>
+            <div>
+              <div className="text-[11px] font-medium uppercase tracking-wider text-gray-400">
+                Selected Dues to Settle
+              </div>
+              <div className="text-base font-bold text-white flex items-center gap-1.5">
+                <span>{formatINR(totalSelectedAmount)}</span>
+                <span className="text-xs font-normal text-gray-400">
+                  ({selectedIds.length} due{selectedIds.length > 1 ? "s" : ""})
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-2 w-full sm:w-auto justify-end">
+            <button
+              type="button"
+              onClick={handleOpenBulkModal}
+              className="flex-1 sm:flex-none inline-flex items-center justify-center px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs sm:text-sm font-bold rounded-xl shadow-md active:scale-95 transition-all cursor-pointer"
+            >
+              <Sparkles className="w-4 h-4 mr-1.5" />
+              Settle Selected ({selectedIds.length})
+            </button>
+            <button
+              type="button"
+              onClick={handleQuickSettleAllSelected}
+              className="hidden md:inline-flex items-center justify-center px-3 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs font-semibold rounded-xl transition-all cursor-pointer"
+              title="Quickly mark all as paid today with default notes"
+            >
+              Pay Today
+            </button>
+            <button
+              type="button"
+              onClick={clearSelection}
+              className="p-2 text-gray-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+              title="Deselect all"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Settle Multiple Dues Modal */}
+      {isBulkModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-100 overflow-y-auto">
+          <div className="bg-white rounded-2xl max-w-2xl w-full shadow-2xl border border-gray-200 my-8 flex flex-col max-h-[90vh] animate-in zoom-in-95 duration-100 overflow-hidden">
+            {/* Modal Header */}
+            <div className="px-6 py-4 border-b border-gray-100 bg-gray-50/50 flex items-center justify-between shrink-0">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900 flex items-center">
+                  <Sparkles className="w-5 h-5 text-indigo-600 mr-2" />
+                  Settle Multiple Dues
+                </h3>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Settling {selectedItems.length} selected dues totaling{" "}
+                  <strong className="text-emerald-700 font-bold">{formatINR(totalSelectedAmount)}</strong>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsBulkModalOpen(false)}
+                className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg cursor-pointer transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Mode Switcher Tabs */}
+            <div className="p-4 bg-gray-50 border-b border-gray-200 shrink-0">
+              <div className="flex p-1 bg-gray-200/80 rounded-xl gap-1">
+                <button
+                  type="button"
+                  onClick={() => setBulkMode("SAME")}
+                  className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center space-x-2 cursor-pointer ${
+                    bulkMode === "SAME"
+                      ? "bg-white text-indigo-950 shadow-xs ring-1 ring-black/5"
+                      : "text-gray-600 hover:text-gray-900"
+                  }`}
+                >
+                  <Layers className="w-4 h-4 text-indigo-600" />
+                  <span>Same Options for All ({selectedItems.length})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSwitchToIndividual}
+                  className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center space-x-2 cursor-pointer ${
+                    bulkMode === "INDIVIDUAL"
+                      ? "bg-white text-indigo-950 shadow-xs ring-1 ring-black/5"
+                      : "text-gray-600 hover:text-gray-900"
+                  }`}
+                >
+                  <Sliders className="w-4 h-4 text-indigo-600" />
+                  <span>Different Options per Due</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body: Scrollable */}
+            <div className="p-6 overflow-y-auto space-y-6 flex-1">
+              {bulkMode === "SAME" ? (
+                /* Mode 1: SAME OPTIONS FOR ALL */
+                <div className="space-y-5">
+                  <div className="p-3.5 bg-indigo-50/60 border border-indigo-100 rounded-xl text-xs text-indigo-900">
+                    <p className="font-semibold text-indigo-950">Apply common payment options to all selected dues:</p>
+                    <p className="text-indigo-700 mt-0.5">
+                      The payment date and note specified below will be applied to all {selectedItems.length} dues.
+                    </p>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">
+                        Common Payment Date
+                      </label>
+                      <input
+                        type="date"
+                        value={bulkCommonDate}
+                        onChange={(e) => setBulkCommonDate(e.target.value)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="text-xs font-semibold text-gray-700">
+                          Common Payment Note
+                        </label>
+                        <span className="text-[11px] text-gray-400">Quick suggestions:</span>
+                      </div>
+                      <input
+                        type="text"
+                        value={bulkCommonNote}
+                        onChange={(e) => setBulkCommonNote(e.target.value)}
+                        placeholder="e.g. Received via UPI / Bank Transfer"
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-indigo-500"
+                      />
+                      {/* Suggestion tags */}
+                      <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                        {["Settlement via UPI", "Paid in Cash", "Bank Transfer", "Google Pay", "PhonePe"].map((tag) => (
+                          <button
+                            key={tag}
+                            type="button"
+                            onClick={() => setBulkCommonNote(tag)}
+                            className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-gray-100 hover:bg-gray-200 text-gray-700 transition-colors cursor-pointer"
+                          >
+                            + {tag}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Summary Preview Table */}
+                  <div className="border border-gray-200 rounded-xl overflow-hidden">
+                    <div className="px-4 py-2 bg-gray-50 border-b border-gray-200 text-xs font-semibold text-gray-700 flex justify-between items-center">
+                      <span>Dues to Settle ({selectedItems.length})</span>
+                      <span>Total: {formatINR(totalSelectedAmount)}</span>
+                    </div>
+                    <div className="max-h-48 overflow-y-auto divide-y divide-gray-100 text-xs">
+                      {selectedItems.map((item) => (
+                        <div key={item.id} className="p-3 flex items-center justify-between hover:bg-gray-50/50">
+                          <div>
+                            <span className="font-bold text-gray-900">{item.loan.borrower.name}</span>
+                            <span className="ml-2 text-gray-500">EMI #{item.installmentNo}</span>
+                            <div className="text-[11px] text-gray-400">Due: {item.dueDateFormatted}</div>
+                          </div>
+                          <div className="flex items-center space-x-3">
+                            <span className="font-bold text-emerald-700 text-sm">{formatINR(item.amount)}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveFromBulkSelection(item.id)}
+                              className="text-gray-400 hover:text-red-600 p-1 rounded-sm cursor-pointer"
+                              title="Remove from settlement"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                /* Mode 2: DIFFERENT OPTIONS PER DUE */
+                <div className="space-y-4">
+                  <div className="p-3.5 bg-amber-50/80 border border-amber-200 rounded-xl text-xs text-amber-900">
+                    <p className="font-semibold text-amber-950">Customize each due individually:</p>
+                    <p className="text-amber-800 mt-0.5">
+                      You can set a different payment date and note for each installment.
+                    </p>
+                  </div>
+
+                  <div className="space-y-3">
+                    {selectedItems.map((item) => {
+                      const cfg = bulkItemConfigs[item.id] || {
+                        paidOn: bulkCommonDate,
+                        note: `EMI #${item.installmentNo} for ${item.loan.borrower.name}`,
+                      };
+
+                      return (
+                        <div
+                          key={item.id}
+                          className="p-4 bg-gray-50/80 border border-gray-200 rounded-xl space-y-3 hover:border-gray-300 transition-colors"
+                        >
+                          {/* Item Header */}
+                          <div className="flex items-center justify-between border-b border-gray-200/80 pb-2">
+                            <div>
+                              <div className="flex items-center space-x-2">
+                                <span className="font-bold text-gray-900 text-sm">
+                                  {item.loan.borrower.name}
+                                </span>
+                                <span className="text-xs px-2 py-0.5 rounded-md font-semibold bg-gray-200 text-gray-700">
+                                  EMI #{item.installmentNo}
+                                </span>
+                                {item.status === "OVERDUE" && (
+                                  <span className="text-[10px] px-1.5 py-0.2 rounded-full font-bold bg-red-100 text-red-700">
+                                    Overdue
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-xs text-gray-500">
+                                Due: {item.dueDateFormatted}
+                              </span>
+                            </div>
+
+                            <div className="flex items-center space-x-3">
+                              <span className="font-bold text-emerald-700 text-base">
+                                {formatINR(item.amount)}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveFromBulkSelection(item.id)}
+                                className="text-gray-400 hover:text-red-600 p-1 rounded-lg cursor-pointer"
+                                title="Remove from settlement"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Individual Inputs */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-[11px] font-semibold text-gray-700 mb-1">
+                                Payment Date
+                              </label>
+                              <input
+                                type="date"
+                                value={cfg.paidOn}
+                                onChange={(e) =>
+                                  updateIndividualItemConfig(item.id, "paidOn", e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-xs text-gray-900 bg-white focus:ring-2 focus:ring-indigo-500"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-[11px] font-semibold text-gray-700 mb-1">
+                                Payment Note
+                              </label>
+                              <input
+                                type="text"
+                                value={cfg.note}
+                                onChange={(e) =>
+                                  updateIndividualItemConfig(item.id, "note", e.target.value)
+                                }
+                                placeholder="Note for this due..."
+                                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-xs text-gray-900 bg-white focus:ring-2 focus:ring-indigo-500"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-6 py-4 bg-gray-50 border-t border-gray-200 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
+              <div className="text-xs text-gray-600">
+                Total to settle:{" "}
+                <strong className="text-emerald-700 text-sm font-bold">
+                  {formatINR(totalSelectedAmount)}
+                </strong>{" "}
+                ({selectedItems.length} dues)
+              </div>
+
+              <div className="flex items-center space-x-3 w-full sm:w-auto justify-end">
+                <button
+                  type="button"
+                  onClick={() => setIsBulkModalOpen(false)}
+                  disabled={bulkSubmitting}
+                  className="px-4 py-2 text-xs font-semibold text-gray-700 hover:bg-gray-200 rounded-lg transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmBulkSettle}
+                  disabled={bulkSubmitting || selectedItems.length === 0}
+                  className="px-5 py-2.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 active:scale-95 rounded-xl transition-all shadow-md cursor-pointer disabled:opacity-50 flex items-center"
+                >
+                  {bulkSubmitting ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 mr-2 animate-spin" />
+                      Settling Dues...
+                    </>
+                  ) : (
+                    <>
+                      <Check className="w-4 h-4 mr-1.5" />
+                      Confirm & Settle {selectedItems.length} Dues
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           </div>
         </div>
