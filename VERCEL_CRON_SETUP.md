@@ -15,10 +15,12 @@ Money Lending Tracker uses Vercel Cron to trigger daily background jobs:
 
 ### What Happens During Each Run:
 1. **Auto-Overdue Sync**: Any `PENDING` installment whose due date has passed (prior to today in IST) is automatically moved to `OVERDUE`.
-2. **2-Day Overdue Self-Reminders**: Any overdue installment that hasn't been reminded within the past 48 hours triggers an alert email to `OWNER_EMAIL`.
-3. **Due Today & Upcoming Reminders**: Loans due today or matching reminder window settings (e.g. 1, 3, 5 days before) are collected.
-4. **Owner Daily Digest**: Combines all active alerts for the day into one clean, formatted morning digest email.
-5. **Borrower Reminders**: If enabled for a specific loan and the borrower has an email address, a polite payment reminder is sent to them.
+2. **Single Consolidated Owner Report**: Sends **EXACTLY ONE** comprehensive email to `OWNER_EMAIL`.
+   - **Person-by-Person Summary**: Summary table showing how much each borrower owes in total.
+   - **All Loan Details**: Complete breakdown of each person's active loans, principal, amount paid, balance owed, monthly cycle dues, and next due date.
+   - **Immediate Dues & Overdue Alerts**: Highlights any past-due installments or dues due today.
+   - **Prevents Inbox Clutter**: No separate individual loan emails or separate overdue digest emails are sent to the owner.
+3. **Borrower Reminders (Optional)**: If `remindBorrower` is enabled for a loan and the borrower has their own separate email address (different from `OWNER_EMAIL`), a polite payment reminder is sent to them.
 
 ---
 

@@ -15,6 +15,7 @@ import {
 
 export default function SettingsPage() {
   const [testing, setTesting] = useState(false);
+  const [sendingSummary, setSendingSummary] = useState(false);
   const [result, setResult] = useState<{ success: boolean; message: string } | null>(null);
 
   const handleTestEmail = async () => {
@@ -40,6 +41,32 @@ export default function SettingsPage() {
       });
     } finally {
       setTesting(false);
+    }
+  };
+
+  const handleSendSummaryReport = async () => {
+    setSendingSummary(true);
+    setResult(null);
+
+    try {
+      const res = await fetch("/api/send-summary", { method: "POST" });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to send summary report email.");
+      }
+
+      setResult({
+        success: true,
+        message: data.message || "Single consolidated summary report sent successfully to your email!",
+      });
+    } catch (err: any) {
+      setResult({
+        success: false,
+        message: err.message || "Failed to send summary report.",
+      });
+    } finally {
+      setSendingSummary(false);
     }
   };
 
@@ -103,7 +130,7 @@ export default function SettingsPage() {
                 {process.env.NEXT_PUBLIC_OWNER_EMAIL || "Configured in OWNER_EMAIL"}
               </p>
               <p className="text-gray-500">
-                Receives all individual due reminders, overdue notices, and daily digests.
+                Receives the single daily consolidated report with borrower summary, dues, and balances.
               </p>
             </div>
 
@@ -122,18 +149,30 @@ export default function SettingsPage() {
 
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pt-2 border-t border-gray-100">
             <div className="text-xs text-gray-500">
-              Click the button to test SMTP connectivity and send a sample email to your inbox.
+              Send the full consolidated report (single email with all borrower balances and dues) or test connection.
             </div>
 
-            <button
-              type="button"
-              onClick={handleTestEmail}
-              disabled={testing}
-              className="inline-flex items-center justify-center px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold shadow-xs transition-colors disabled:opacity-50"
-            >
-              <Send className="w-3.5 h-3.5 mr-2" />
-              <span>{testing ? "Testing Connection..." : "Send Test Email"}</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleSendSummaryReport}
+                disabled={sendingSummary || testing}
+                className="inline-flex items-center justify-center px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-bold shadow-xs transition-colors disabled:opacity-50"
+              >
+                <Mail className="w-3.5 h-3.5 mr-2" />
+                <span>{sendingSummary ? "Sending Report..." : "Send Daily Summary Email Now"}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleTestEmail}
+                disabled={testing || sendingSummary}
+                className="inline-flex items-center justify-center px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+              >
+                <Send className="w-3.5 h-3.5 mr-2" />
+                <span>{testing ? "Testing..." : "Test SMTP"}</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
